@@ -13,6 +13,10 @@ from entmax import entmax15
 
 from x_transformers.autoregressive_wrapper import AutoregressiveWrapper
 
+from flash_cosine_sim_attention import flash_cosine_sim_attention
+from memory_efficient_attention_pytorch import Attention as MemoryEfficientAttention
+
+
 # constants
 
 DEFAULT_DIM_HEAD = 64
@@ -536,9 +540,11 @@ class Attention(nn.Module):
         one_kv_head = False,
         shared_kv = False,
         value_dim_head = None,
-        tensor_product = False   # https://arxiv.org/abs/2208.06061
+        tensor_product = False,   # https://arxiv.org/abs/2208.06061
+        flash_cosine_sim = False,
     ):
         super().__init__()
+        #print("HELLO")
         self.scale = dim_head ** -0.5
 
         self.heads = heads
@@ -583,6 +589,12 @@ class Attention(nn.Module):
         assert (not qk_norm) or (dim_head % qk_norm_groups) == 0, 'dimension per attention head must be divisible by the qk norm groups'
         assert not (qk_norm and (dim_head // qk_norm_groups) <= 2), 'the group dimension may be too small (2 was too small in my tests, but 4 still works, surprisingly)'
 
+        # flash cosine sim
+        self.flash_cosine_sim = flash_cosine_sim
+        # memory efficient
+        self.memory_efficient = memory_efficient
+        #print(self.flash_cosine_sim )
+
         # talking heads
         self.talking_heads = talking_heads
         if talking_heads:
@@ -626,7 +638,7 @@ class Attention(nn.Module):
         rotary_pos_emb = None,
         prev_attn = None,
         mem = None
-    ):
+    ):            
         b, n, _, h, talking_heads, head_scale, scale, device, has_context = *x.shape, self.heads, self.talking_heads, self.head_scale, self.scale, x.device, exists(context)
         kv_input = default(context, x)
 
@@ -676,6 +688,27 @@ class Attention(nn.Module):
             v = torch.cat((mem_v, v), dim = -2)
             if exists(input_mask):
                 input_mask = F.pad(input_mask, (self.num_mem_kv, 0), value = True)
+
+        if  self.flash_cosine_sim:
+            # make sure not using any of these as not compatible.
+            assert not exists(prev_attn)
+            assert not talking_heads
+            assert not exists(rel_pos)
+            assert not exists(input_mask)
+            assert not exists(attn_mask)
+            assert not exists(self.max_attend_past)
+            assert not self.causal
+            assert not (exists(self.sparse_topk) and self.sparse_topk < dots.shape[-1])
+            assert not talking_heads
+            assert not exists(r)
+            assert not head_scale
+            assert not exists(self.to_v_gate)
+
+            out = flash_cosine_sim_attention(q,k,v,self.qk_norm_scale)
+            out = rearrange(out, 'b h n d -> b n (h d)')
+            out = self.to_out(out)
+            #print(out.shape)
+            return out,None      
 
         if self.qk_norm:
             qk_l2norm = partial(l2norm, groups = self.qk_norm_groups)
@@ -803,6 +836,7 @@ class AttentionLayers(nn.Module):
         shift_tokens = 0,
         sandwich_norm = False,
         zero_init_branch_output = False,
+        memory_efficient=False,
         **kwargs
     ):
         super().__init__()
@@ -903,13 +937,15 @@ class AttentionLayers(nn.Module):
 
         # iterate and construct layers
 
+        AttentionCls = Attention if not memory_efficient else MemoryEfficientAttention
+
         for ind, (layer_type, layer_shift_tokens) in enumerate(zip(self.layer_types, shift_tokens)):
             is_last_layer = ind == (len(self.layer_types) - 1)
 
             if layer_type == 'a':
-                layer = Attention(dim, heads = heads, causal = causal, **attn_kwargs)
+                layer = AttentionCls(dim=dim, heads = heads, causal = causal, memory_efficient = memory_efficient, **attn_kwargs)
             elif layer_type == 'c':
-                layer = Attention(dim, heads = heads, **attn_kwargs)
+                layer = AttentionCls(dim=dim, heads = heads, memory_efficient = memory_efficient, **attn_kwargs)
             elif layer_type == 'f':
                 layer = FeedForward(dim, **ff_kwargs)
                 layer = layer if not macaron else Scale(0.5, layer)
